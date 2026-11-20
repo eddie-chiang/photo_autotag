@@ -1,0 +1,15 @@
+# photo_autotag runtime and personal files -- contain your folder and file names
+photo_autotag.json
+*.db
+*.db-journal
+*.log
+*.csv
+.photo_autotag.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# OS clutter
+.DS_Store
+Thumbs.db

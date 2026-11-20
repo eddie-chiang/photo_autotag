@@ -1,0 +1,7 @@
+{
+  "excluded_dirs": ["Screenshots to sort"],
+  "folder_ignore": ["Exports", "Selects"],
+  "generic_words": ["wallpaper"],
+  "keep_foreign_keywords": true,
+  "use_stem_keywords": true
+}
