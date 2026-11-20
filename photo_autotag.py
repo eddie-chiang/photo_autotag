@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,12 @@ from pathlib import Path
 # Defaults live here. Archive-specific additions belong in photo_autotag.json
 # next to the script (see README), so this file can be updated without merging.
 # =============================================================================
-SOURCE_DIR = Path(__file__).resolve().parent  # archive root; override with --root
+# The script's own folder holds its settings, cache, log and lock file. It is
+# also the default archive root, so the simplest setup is to drop the script into
+# the archive. To run from another machine, keep it in a local folder and point
+# --root at the mounted share.
+STATE_DIR = Path(__file__).resolve().parent
+SOURCE_DIR = STATE_DIR  # archive root; override with --root
 LOG_FILE = "photo_autotag.log"
 DB_FILE = "photo_autotag.db"
 LOCK_FILE = ".photo_autotag.lock"
@@ -79,12 +85,12 @@ IPTC_KEYWORD_BYTES = 64
 IPTC_EXTS = {".jpg", ".jpeg", ".jpe", ".tif", ".tiff", ".psd"}
 
 
-def load_config(root: Path):
-    """Merge optional <root>/photo_autotag.json into the defaults above:
+def load_config(state_dir: Path):
+    """Merge optional photo_autotag.json (next to the script) into the defaults:
     {"excluded_dirs": [...], "folder_ignore": [...], "generic_words": [...],
      "keep_foreign_keywords": true, "use_stem_keywords": true}"""
     global KEEP_FOREIGN_KEYWORDS, USE_STEM_KEYWORDS
-    path = root / CONFIG_FILE
+    path = state_dir / CONFIG_FILE
     if not path.is_file():
         return
     with open(path, encoding="utf-8") as f:
@@ -406,7 +412,10 @@ def iter_media_files():
             if name.startswith(".") or Path(name).suffix.lower() not in MEDIA_EXTS:
                 continue
             file_path = Path(root) / name
-            yield file_path, file_path.relative_to(SOURCE_DIR)
+            # NFC-normalise so paths and keywords are identical whether the share is
+            # read on the NAS or over SMB from a Mac (which can return NFD names).
+            rel = unicodedata.normalize("NFC", str(file_path.relative_to(SOURCE_DIR)))
+            yield file_path, Path(rel)
 
 
 class ExifToolSession:
@@ -489,7 +498,7 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                 current = meta.get("Keywords") or meta.get("Subject") or []
                 if not isinstance(current, list):
                     current = [current]
-                current = [str(k).strip() for k in current if str(k).strip()]
+                current = [unicodedata.normalize("NFC", str(k).strip()) for k in current if str(k).strip()]
 
                 byte_limit = IPTC_KEYWORD_BYTES if file_path.suffix.lower() in IPTC_EXTS else None
                 prior = previously_written(conn, rel, fingerprint, mtime)
@@ -590,8 +599,9 @@ def prune_db(db_path, dry_run=False, yes=False):
     """Delete cache rows for files that no longer exist."""
     conn = init_db(db_path)
     rows = [r[0] for r in conn.execute("SELECT file_path FROM processed_files")]
-    gone = [p for p in rows if not (SOURCE_DIR / p).exists()]
-    print(f"Archive root: {SOURCE_DIR}")
+    print(f"Archive root: {SOURCE_DIR} (scanning...)")
+    existing = {str(rel) for _, rel in iter_media_files()}  # NFC, same as the cache
+    gone = [p for p in rows if p not in existing]
     for p in gone[:20]:
         print(f"  {'would remove' if dry_run else 'removed'}: {p}")
     if len(gone) > 20:
@@ -614,7 +624,7 @@ def acquire_lock():
         import fcntl
     except ImportError:
         return None
-    fh = open(SOURCE_DIR / LOCK_FILE, "w")
+    fh = open(STATE_DIR / LOCK_FILE, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -628,9 +638,9 @@ def main():
     p = argparse.ArgumentParser(description="Incremental EXIF keyword tagging from folder names. See README.md.")
     p.add_argument("--dry-run", action="store_true", help="Log what would change without writing to any file")
     p.add_argument("--force", action="store_true", help="Ignore the cache and re-check every file (slow)")
-    p.add_argument("--root", help="Archive root (default: the folder this script is in)")
-    p.add_argument("--db", help=f"Cache database (default: <root>/{DB_FILE})")
-    p.add_argument("--log", help=f"Audit log (default: <root>/{LOG_FILE})")
+    p.add_argument("--root", help="Archive root, e.g. a mounted share (default: the folder this script is in)")
+    p.add_argument("--db", help=f"Cache database (default: {DB_FILE} next to the script)")
+    p.add_argument("--log", help=f"Audit log (default: {LOG_FILE} next to the script)")
     p.add_argument("--keywords-report", metavar="CSV",
                    help="Write every derived keyword with a file count, from paths only, then exit")
     p.add_argument("--prune", action="store_true", help="Remove cache rows for files that no longer exist, then exit")
@@ -641,9 +651,9 @@ def main():
         SOURCE_DIR = Path(args.root).resolve()
     if not SOURCE_DIR.is_dir():
         sys.exit(f"Archive root not found: {SOURCE_DIR}")
-    load_config(SOURCE_DIR)
-    db_path = args.db or str(SOURCE_DIR / DB_FILE)
-    log_path = args.log or str(SOURCE_DIR / LOG_FILE)
+    load_config(STATE_DIR)
+    db_path = args.db or str(STATE_DIR / DB_FILE)
+    log_path = args.log or str(STATE_DIR / LOG_FILE)
 
     if args.keywords_report:
         keywords_report(args.keywords_report)

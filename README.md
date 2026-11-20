@@ -41,7 +41,10 @@ It's incremental: each run only processes files that are new or changed since th
 
 ## Installation
 
-Copy `photo_autotag.py` into the **root folder of your photo archive**. By default the script treats its own folder as the archive root, and keeps its database and log there.
+The script keeps its settings, cache, log and lock file **in its own folder**, and by default also treats that folder as the archive root. So there are two ways to set it up:
+
+- **On the machine with the photos (e.g. the NAS):** copy `photo_autotag.py` into the root folder of your photo archive.
+- **On another computer, against a network share:** keep the script in a local folder and point `--root` at the mounted share. See [Running from a Mac against a NAS share](#running-from-a-mac-against-a-nas-share).
 
 ```
 Photos/
@@ -52,7 +55,7 @@ Photos/
 └── Family/
 ```
 
-To keep the script somewhere else, use `--root /path/to/Photos`.
+
 
 ## Quick start
 
@@ -83,9 +86,9 @@ The dry run doesn't update the cache, so the real run still checks every file.
 | *(none)* | Incremental run: tag new or changed files, skip everything else. |
 | `--dry-run` | Log what would change without writing to any file. Combine with `--force` to check the whole archive. With `--prune`, lists stale rows without deleting them. |
 | `--force` | Ignore the cache and re-check every file. Use after changing the keyword rules or configuration. Slow on large archives. |
-| `--root PATH` | Archive root. Default: the folder the script is in. |
-| `--db PATH` | Cache database. Default: `<root>/photo_autotag.db`. |
-| `--log PATH` | Audit log. Default: `<root>/photo_autotag.log`. |
+| `--root PATH` | Archive root, e.g. a mounted network share. Default: the folder the script is in. |
+| `--db PATH` | Cache database. Default: `photo_autotag.db` next to the script. |
+| `--log PATH` | Audit log. Default: `photo_autotag.log` next to the script. |
 | `--keywords-report CSV` | Write a CSV of every keyword the rules derive from your paths, with a file count and an example path, then exit. Never reads or writes photo files. |
 | `--prune` | Remove cache rows for files that no longer exist (deleted, moved or renamed), then exit. Refuses to remove more than 5% of rows, because that usually means the wrong root or an unmounted share. |
 | `--yes` | Allow `--prune` to remove more than 5% of rows. |
@@ -148,6 +151,30 @@ Keeping your settings in this file means you can update `photo_autotag.py` witho
 
 After changing any setting, check the effect with `--keywords-report`, then apply it to already-tagged files with `--force --dry-run` followed by `--force`.
 
+## Running from a Mac against a NAS share
+
+The photos can stay on the NAS while the script, its cache, log and reports live on your Mac.
+
+1. **Install the tools:** `brew install exiftool` (Python 3 comes with Xcode Command Line Tools, or `brew install python`).
+2. **Mount the share:** in Finder, Go → Connect to Server (⌘K), enter `smb://<nas-name-or-ip>/<share>`, and connect. It appears under `/Volumes/<share>`.
+3. **Make a local folder for the script**, e.g. `~/photo_autotag/`, containing `photo_autotag.py` and, if you use one, `photo_autotag.json`. If you've already been running the script on the NAS, copy its `photo_autotag.db` here too so the Mac can reuse the cache instead of re-checking everything.
+4. **Run it with `--root`:**
+   ```bash
+   cd ~/photo_autotag
+   python3 photo_autotag.py --root /Volumes/<share>/Photos --keywords-report report.csv
+   python3 photo_autotag.py --root /Volumes/<share>/Photos --dry-run
+   caffeinate -i python3 photo_autotag.py --root /Volumes/<share>/Photos
+   ```
+   `caffeinate -i` stops the Mac sleeping (and dropping the share) during a long run.
+
+Notes:
+
+- **Everything except the photos stays on the Mac:** the database, the log, the lock file and your `photo_autotag.json` are read from and written to the script's folder. Pass the report a local path (as above) and it lands there too.
+- **Paths are Unicode-normalised (NFC),** so the cache and keywords match whether the share is read on the NAS or over SMB from a Mac. Accented and CJK folder names don't cause duplicate work.
+- **Don't run it from the NAS and the Mac at the same time.** The lock file only prevents overlapping runs on the same machine.
+- macOS's `._*` and `.DS_Store` files on the share are ignored automatically.
+- Writing metadata over SMB is slower than on the NAS itself, so expect a first run to take longer; later incremental runs are quick.
+
 ## Running on a schedule
 
 Each run only touches new or changed files and exits quickly when there's nothing to do, so it's suitable for a nightly job. If a run is still going when the next one starts, the second exits immediately.
@@ -170,9 +197,9 @@ Scheduled tasks start with a minimal `PATH`, so make sure the folder containing 
 |---|---|
 | `photo_autotag.db` | SQLite cache: one row per file with its size, modification time, original keywords, the keywords the script wrote, date, and status (`SUCCESS`, `SKIPPED` or `ERROR`). Deleting it is safe: the next run re-checks every file and rebuilds it, but the script then can't tell which existing keywords it wrote, so after a folder rename both old and new keywords may remain until you clean them up. |
 | `photo_autotag.log` | Append-only audit log: every file changed, its new keywords, the keywords removed, any date backfilled, and a summary per run. |
-| `.photo_autotag.lock` | Lock file that prevents overlapping runs. |
+| `.photo_autotag.lock` | Lock file that prevents overlapping runs on the same machine. |
 
-Your `photo_autotag.json`, if you create one, sits alongside these.
+All of these, and your `photo_autotag.json` if you create one, live in the script's folder, which isn't necessarily the archive.
 
 **These files contain your folder and file names. Don't commit them to a public repository.** The included `.gitignore` excludes them, including `photo_autotag.json`.
 
