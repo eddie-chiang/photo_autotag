@@ -344,21 +344,26 @@ def init_db(db_path):
             new_date TEXT,
             new_keywords TEXT,        -- JSON list of keywords this script wrote
             status TEXT,              -- SUCCESS | SKIPPED | ERROR
-            processed_date TIMESTAMP
+            processed_date TIMESTAMP,
+            error_message TEXT        -- reason for ERROR status; NULL otherwise
         )
     """)
+    try:
+        conn.execute("ALTER TABLE processed_files ADD COLUMN error_message TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON processed_files (file_hash, mod_time)")
     conn.commit()
     return conn
 
 
 def save_row(conn, rel_path_str, fingerprint, mtime, orig_date, orig_keywords,
-             new_date, new_keywords, status, commit=True):
+             new_date, new_keywords, status, commit=True, error_message=None):
     conn.execute(
-        "INSERT OR REPLACE INTO processed_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO processed_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (rel_path_str, fingerprint, mtime, orig_date, json.dumps(orig_keywords, ensure_ascii=False),
          new_date, json.dumps(new_keywords, ensure_ascii=False), status,
-         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), error_message),
     )
     if commit:
         conn.commit()
@@ -557,6 +562,9 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                 if meta is None or "Error" in meta:
                     reason = meta.get("Error") if meta else "exiftool read failed"
                     log.write(f"{now()} | ERROR reading metadata for {rel}: {reason}\n")
+                    save_row(conn, rel, fingerprint, mtime, None, [], None, [], "ERROR",
+                             error_message=reason)
+                    pending_commits = 0
                     errors += 1
                     continue
                 current = meta.get("Keywords") or meta.get("Subject") or []
@@ -615,6 +623,9 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                     res = run_exiftool(args)
                 except OSError as e:
                     log.write(f"{now()} | ERROR on {rel}: {e}\n")
+                    save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "ERROR",
+                             error_message=str(e))
+                    pending_commits = 0
                     errors += 1
                     continue
                 output = res.stdout.strip()
@@ -637,7 +648,8 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                     log.write(f"{now()} | ERROR on {rel}: {output}\n")
                     print(f"ERROR on {rel}: {output}")
                     # Cached so normal runs skip it until the file changes; --force retries.
-                    save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "ERROR")
+                    save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "ERROR",
+                             error_message=output)
                     pending_commits = 0
                 log.flush()
 
