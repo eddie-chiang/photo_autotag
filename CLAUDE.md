@@ -18,7 +18,9 @@ Guidance for Claude Code when working in this repository.
 - **Cache semantics:** `file_hash` is a `size:<bytes>` fingerprint and `mod_time` is the mtime, both taken *after* a successful write. `new_keywords` is a JSON list of exactly what the script wrote. It is what lets hand-added keywords survive (`build_final_keywords`) and lets renamed or moved files be matched by size and mtime (`previously_written`).
 - **Keyword comparison is exact set equality** with what's on the file, not a subset check.
 - **IPTC 64-byte limit:** keywords for `IPTC_EXTS` are truncated on a character boundary (`fit_keyword`) before comparing and writing, so re-runs converge.
-- **`--prune` safety:** it compares against a fresh NFC scan and refuses to delete more than 5% of rows without `--yes`. Keep both.
+- **`--prune` safety:** it compares against a fresh NFC scan, refuses to run if any directory couldn't be read, and refuses to delete more than 5% of rows without `--yes`. Keep all three.
+- **A failed metadata read is an error, never "no keywords, no date".** `get_metadata` returns `None` on a timeout, crash or unparseable output, and an exiftool `Error` field is also treated as a failure. Treating either as empty metadata would wipe hand-added keywords and backfill dates onto files that already have them.
+- **The lock is `flock` only.** The OS releases it when the process exits; don't add PID files, which go stale and can block scheduled runs after PID reuse.
 - **State lives next to the script** (`STATE_DIR`): config, database, log and lock file. The archive (`--root`) only has its photos modified.
 - **Failed writes are cached as `ERROR`** so they aren't retried every run. `--force` retries them.
 

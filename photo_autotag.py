@@ -19,6 +19,8 @@ import json
 import os
 import random
 import re
+import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -331,6 +333,7 @@ def retry_on_disk_io(max_retries=5, base_delay=2, max_delay=900):
 
 def init_db(db_path):
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
             file_path TEXT PRIMARY KEY,
@@ -350,14 +353,15 @@ def init_db(db_path):
 
 
 def save_row(conn, rel_path_str, fingerprint, mtime, orig_date, orig_keywords,
-             new_date, new_keywords, status):
+             new_date, new_keywords, status, commit=True):
     conn.execute(
         "INSERT OR REPLACE INTO processed_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (rel_path_str, fingerprint, mtime, orig_date, json.dumps(orig_keywords, ensure_ascii=False),
          new_date, json.dumps(new_keywords, ensure_ascii=False), status,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _parse_keywords(value):
@@ -405,8 +409,17 @@ def extract_date_from_path(path_str):
     return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 00:00:00" if m else None
 
 
+WALK_ERRORS = []  # unreadable directories seen by the last scan
+
+
+def _walk_error(e):
+    WALK_ERRORS.append(e)
+    print(f"  Warning: skipping unreadable directory: {e}")
+
+
 def iter_media_files():
-    for root, dirs, files in os.walk(SOURCE_DIR):
+    WALK_ERRORS.clear()
+    for root, dirs, files in os.walk(SOURCE_DIR, onerror=_walk_error):
         dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith("."))
         for name in sorted(files):
             if name.startswith(".") or Path(name).suffix.lower() not in MEDIA_EXTS:
@@ -419,31 +432,69 @@ def iter_media_files():
 
 
 class ExifToolSession:
-    """One long-running exiftool process for fast metadata reads."""
+    """One long-running exiftool process for fast metadata reads.
+    Restarts automatically on crash or timeout."""
+    READ_TIMEOUT = 30
 
     def __init__(self):
+        self._start()
+
+    def _start(self):
         self.proc = subprocess.Popen(
             ["exiftool", "-stay_open", "True", "-@", "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # stderr discarded: mixed into stdout, stray warnings break JSON parsing
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8",
         )
 
+    def _restart(self):
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        self._start()
+
+    @staticmethod
+    def _alarm_handler(signum, frame):
+        raise TimeoutError("exiftool read timed out")
+
     def get_metadata(self, file_path):
-        args = [str(file_path), "-j", "-Keywords", "-Subject", "-DateTimeOriginal",
-                "-CreateDate", "-QuickTime:CreateDate", "-execute"]
-        self.proc.stdin.write("\n".join(args) + "\n")
-        self.proc.stdin.flush()
-        lines = []
-        while True:
-            line = self.proc.stdout.readline()
-            if not line or "{ready}" in line:
-                break
-            lines.append(line)
+        """Returns metadata dict, or None on read failure."""
+        if self.proc.poll() is not None:
+            self._restart()
+        try:
+            args = [str(file_path), "-j", "-Keywords", "-Subject", "-DateTimeOriginal",
+                    "-CreateDate", "-QuickTime:CreateDate", "-execute"]
+            self.proc.stdin.write("\n".join(args) + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            self._restart()
+            return None
+        use_alarm = hasattr(signal, "SIGALRM")
+        if use_alarm:
+            old_handler = signal.signal(signal.SIGALRM, self._alarm_handler)
+            signal.alarm(self.READ_TIMEOUT)
+        try:
+            lines = []
+            while True:
+                line = self.proc.stdout.readline()
+                if not line or "{ready}" in line:
+                    break
+                lines.append(line)
+        except TimeoutError:
+            print(f"  exiftool timed out reading {file_path}; restarting")
+            self._restart()
+            return None
+        finally:
+            if use_alarm:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
         try:
             data = json.loads("".join(lines))
             return data[0] if data else {}
         except ValueError:
-            return {}
+            return None
 
     def close(self):
         try:
@@ -465,10 +516,13 @@ def run_exiftool(args):
 # =============================================================================
 def process_photos(db_path, log_path, dry_run=False, force=False):
     mode = " [DRY RUN]" if dry_run else ""
-    print(f"photo_autotag{mode}: scanning {SOURCE_DIR}")
+    files = list(iter_media_files())
+    print(f"photo_autotag{mode}: {len(files)} files in {SOURCE_DIR}"
+          + (" (--force: re-checking all)" if force else ""))
     conn = init_db(db_path)
     et = ExifToolSession()
-    updated = skipped = errors = 0
+    updated = skipped = errors = checked = pending_commits = 0
+    last_progress = time.monotonic()
 
     def now():
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -477,8 +531,13 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"\n=== Run started {now()}{mode} (root {SOURCE_DIR}) ===\n")
 
-            for file_path, rel_path in iter_media_files():
+            for file_path, rel_path in files:
                 rel = str(rel_path)
+                checked += 1
+                if time.monotonic() - last_progress >= 30:
+                    print(f"  Progress: {checked}/{len(files)} checked,"
+                          f" {updated} updated, {errors} errors")
+                    last_progress = time.monotonic()
                 try:
                     fingerprint, mtime = get_fingerprint(file_path)
                 except OSError as e:
@@ -495,6 +554,11 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                         continue
 
                 meta = et.get_metadata(file_path)
+                if meta is None or "Error" in meta:
+                    reason = meta.get("Error") if meta else "exiftool read failed"
+                    log.write(f"{now()} | ERROR reading metadata for {rel}: {reason}\n")
+                    errors += 1
+                    continue
                 current = meta.get("Keywords") or meta.get("Subject") or []
                 if not isinstance(current, list):
                     current = [current]
@@ -521,7 +585,12 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                 if keywords_match and not backfill:
                     skipped += 1
                     if not dry_run:
-                        save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "SKIPPED")
+                        save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "SKIPPED",
+                                 commit=False)
+                        pending_commits += 1
+                        if pending_commits >= 500:
+                            conn.commit()
+                            pending_commits = 0
                     continue
 
                 removed = [k for k in current if k not in final]
@@ -562,14 +631,18 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                     except OSError:
                         pass
                     save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "SUCCESS")
+                    pending_commits = 0
                 else:
                     errors += 1
                     log.write(f"{now()} | ERROR on {rel}: {output}\n")
                     print(f"ERROR on {rel}: {output}")
                     # Cached so normal runs skip it until the file changes; --force retries.
                     save_row(conn, rel, fingerprint, mtime, orig_date, current, new_date, final, "ERROR")
+                    pending_commits = 0
                 log.flush()
 
+            if pending_commits:
+                conn.commit()
             summary = (f"Run complete{mode}: {skipped} unchanged, "
                        f"{updated} {'would be updated' if dry_run else 'updated'}, {errors} errors")
             log.write(f"{now()} | {summary}\n")
@@ -598,28 +671,35 @@ def keywords_report(out_csv):
 def prune_db(db_path, dry_run=False, yes=False):
     """Delete cache rows for files that no longer exist."""
     conn = init_db(db_path)
-    rows = [r[0] for r in conn.execute("SELECT file_path FROM processed_files")]
+    total_rows = conn.execute("SELECT COUNT(*) FROM processed_files").fetchone()[0]
     print(f"Archive root: {SOURCE_DIR} (scanning...)")
     existing = {str(rel) for _, rel in iter_media_files()}  # NFC, same as the cache
-    gone = [p for p in rows if p not in existing]
+    if WALK_ERRORS and not dry_run:
+        conn.close()
+        print(f"REFUSING to prune: {len(WALK_ERRORS)} director{'y' if len(WALK_ERRORS) == 1 else 'ies'} "
+              "couldn't be read, so files in them would look deleted. Fix access and retry.")
+        return
+    gone = [r[0] for r in conn.execute("SELECT file_path FROM processed_files")
+            if r[0] not in existing]
     for p in gone[:20]:
         print(f"  {'would remove' if dry_run else 'removed'}: {p}")
     if len(gone) > 20:
         print(f"  ... and {len(gone) - 20} more")
-    if not dry_run and gone and not yes and len(gone) > max(20, 0.05 * len(rows)):
-        print(f"REFUSING to remove {len(gone)} of {len(rows)} rows (>5%). Usually the archive "
+    if not dry_run and gone and not yes and len(gone) > max(20, 0.05 * total_rows):
+        print(f"REFUSING to remove {len(gone)} of {total_rows} rows (>5%). Usually the archive "
               "root is wrong or the share isn't mounted. Check with --dry-run, then use --yes.")
     elif not dry_run and gone:
         conn.executemany("DELETE FROM processed_files WHERE file_path = ?", [(p,) for p in gone])
         conn.commit()
-        print(f"{len(gone)} stale rows removed (of {len(rows)}).")
+        print(f"{len(gone)} stale rows removed (of {total_rows}).")
     else:
-        print(f"{len(gone)} stale rows found (of {len(rows)}).")
+        print(f"{len(gone)} stale rows found (of {total_rows}).")
     conn.close()
 
 
 def acquire_lock():
-    """Exit quietly if another run is in progress (POSIX only)."""
+    """Exit quietly if another run is in progress (POSIX only). The lock is
+    released by the OS when the process exits, so a crash can't leave it stale."""
     try:
         import fcntl
     except ImportError:
@@ -662,6 +742,8 @@ def main():
     if args.prune:
         prune_db(db_path, dry_run=args.dry_run, yes=args.yes)
     else:
+        if not shutil.which("exiftool"):
+            sys.exit("exiftool not found on PATH. Install it (see README.md) and try again.")
         process_photos(db_path, log_path, dry_run=args.dry_run, force=args.force)
 
 
