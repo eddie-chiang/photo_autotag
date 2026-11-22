@@ -353,6 +353,7 @@ def init_db(db_path):
     except sqlite3.OperationalError:
         pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON processed_files (file_hash, mod_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON processed_files (status)")
     conn.commit()
     return conn
 
@@ -526,7 +527,7 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
           + (" (--force: re-checking all)" if force else ""))
     conn = init_db(db_path)
     et = ExifToolSession()
-    updated = skipped = errors = checked = pending_commits = 0
+    updated = skipped = errors = notices = checked = pending_commits = 0
     last_progress = time.monotonic()
 
     def now():
@@ -634,6 +635,7 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
                     updated += 1
                     if "Warning:" in output:
                         log.write(f"{now()} | NOTICE on {rel}: {output} | {detail}\n")
+                        notices += 1
                     else:
                         log.write(f"{now()} | SUCCESS: {detail}\n")
                     print(f"Updated: {rel}")
@@ -655,8 +657,9 @@ def process_photos(db_path, log_path, dry_run=False, force=False):
 
             if pending_commits:
                 conn.commit()
-            summary = (f"Run complete{mode}: {skipped} unchanged, "
-                       f"{updated} {'would be updated' if dry_run else 'updated'}, {errors} errors")
+            summary = (f"Run complete{mode}: {len(files)} files, {skipped} unchanged, "
+                       f"{updated} {'would be updated' if dry_run else 'updated'}, {errors} errors"
+                       + (f", {notices} notices" if notices else ""))
             log.write(f"{now()} | {summary}\n")
             print(f"\n{summary}")
     finally:
